@@ -18,6 +18,7 @@ const unsigned long wifiRetryDelay = 15000;
 const unsigned long ntpRetryDelay = 10000;
 
 // ===== Joystick =====
+const int snoozeButtonPin = 18;
 const int joystickSwitchPin = 5;
 const int joystickYPin = 33;
 const int joystickXPin = 32;
@@ -31,6 +32,19 @@ int joystickYCenter = 2048;
 // ===== Buzzer =====
 const int buzzerPin = 23;
 const unsigned long startupAlarmDuration = 3000;
+const unsigned long alarmRingDuration = 30000;
+const unsigned long alarmBeepLength = 180;
+const unsigned long alarmPauseLength = 120;
+
+// ===== Servo =====
+const int servoPin = 16;
+const int servoChannel = 1;
+const int servoResolution = 16;
+const int servoFrequency = 50;
+const int servoMinPulse = 500;
+const int servoMaxPulse = 2500;
+const int servoPeriod = 20000;
+const unsigned long alarmServoMoveDelay = 250;
 
 bool alarmEnabled = false;
 int alarmHour = 7;
@@ -62,12 +76,23 @@ int draftAlarmMinute = 0;
 bool draftAlarmPm = false;
 bool wifiConnected = false;
 bool timeSynced = false;
+bool alarmRinging = false;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastWiFiAttempt = 0;
 unsigned long lastNtpAttempt = 0;
+unsigned long lastSnoozeButtonChange = 0;
 unsigned long lastSwitchChange = 0;
 unsigned long switchPressedAt = 0;
 unsigned long lastJoystickAction = 0;
+unsigned long alarmStartedAt = 0;
+unsigned long lastAlarmBeepChange = 0;
+unsigned long lastAlarmServoMove = 0;
+int lastAlarmTriggerDay = -1;
+bool alarmBeepOn = false;
+bool alarmServoAtMax = false;
+int snoozeButtonState = HIGH;
+int lastSnoozeButtonState = HIGH;
+int stableSnoozeButtonState = HIGH;
 int switchState = HIGH;
 int lastSwitchState = HIGH;
 int stableSwitchState = HIGH;
@@ -75,6 +100,36 @@ bool displayDirty = true;
 
 void stopBuzzer() {
   digitalWrite(buzzerPin, LOW);
+}
+
+void writeServoAngle(int angle) {
+  angle = constrain(angle, 0, 180);
+  int pulseWidth = map(angle, 0, 180, servoMinPulse, servoMaxPulse);
+  uint32_t duty = ((uint32_t)pulseWidth * ((1 << servoResolution) - 1)) / servoPeriod;
+  ledcWrite(servoChannel, duty);
+}
+
+void moveStartupServo() {
+  ledcSetup(servoChannel, servoFrequency, servoResolution);
+  ledcAttachPin(servoPin, servoChannel);
+
+  writeServoAngle(0);
+  delay(400);
+  writeServoAngle(90);
+  delay(400);
+  writeServoAngle(180);
+  delay(400);
+  writeServoAngle(90);
+  delay(400);
+}
+
+void stopAlarm() {
+  alarmRinging = false;
+  alarmBeepOn = false;
+  alarmServoAtMax = false;
+  stopBuzzer();
+  writeServoAngle(90);
+  displayDirty = true;
 }
 
 void playStartupAlarm() {
@@ -188,7 +243,7 @@ void displayDateTime() {
   char line1[17];
   char line2[17];
 
-  strftime(line1, sizeof(line1), "%H:%M:%S   %Z", &timeInfo);
+  strftime(line1, sizeof(line1), "%I:%M:%S %p", &timeInfo);
   strftime(line2, sizeof(line2), "%m/%d/%Y %a", &timeInfo);
 
   lcd.clear();
@@ -196,6 +251,14 @@ void displayDateTime() {
   lcd.print(line1);
   lcd.setCursor(0, 1);
   lcd.print(line2);
+}
+
+void displayAlarmRinging() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("ALARM!");
+  lcd.setCursor(0, 1);
+  lcd.print("Click to stop");
 }
 
 int to12Hour(int hour24) {
@@ -218,6 +281,8 @@ void saveDraftAlarmTime() {
 
   alarmHour = hour24;
   alarmMinute = draftAlarmMinute;
+  alarmEnabled = true;
+  lastAlarmTriggerDay = -1;
   displayDirty = true;
 }
 
@@ -228,10 +293,11 @@ void displayAlarmMenu() {
   snprintf(
     line1,
     sizeof(line1),
-    "Alarm %s %02d:%02d",
+    "Alarm %s %02d:%02d%s",
     alarmEnabled ? "ON " : "OFF",
     to12Hour(alarmHour),
-    alarmMinute
+    alarmMinute,
+    alarmHour >= 12 ? "P" : "A"
   );
 
   lcd.clear();
@@ -347,6 +413,88 @@ void handleShortPressEvent() {
   }
 }
 
+void readSnoozeButton() {
+  snoozeButtonState = digitalRead(snoozeButtonPin);
+
+  if (snoozeButtonState != lastSnoozeButtonState) {
+    lastSnoozeButtonChange = millis();
+  }
+
+  if (millis() - lastSnoozeButtonChange > debounceDelay) {
+    if (snoozeButtonState != stableSnoozeButtonState) {
+      stableSnoozeButtonState = snoozeButtonState;
+      if (stableSnoozeButtonState == LOW && alarmRinging) {
+        stopAlarm();
+      }
+    }
+  }
+
+  lastSnoozeButtonState = snoozeButtonState;
+}
+
+void startAlarm(const tm& timeInfo) {
+  alarmRinging = true;
+  alarmStartedAt = millis();
+  lastAlarmBeepChange = millis();
+  lastAlarmServoMove = millis();
+  lastAlarmTriggerDay = timeInfo.tm_yday;
+  alarmBeepOn = true;
+  alarmServoAtMax = true;
+  digitalWrite(buzzerPin, HIGH);
+  writeServoAngle(180);
+  currentScreen = SCREEN_CLOCK;
+  displayDirty = true;
+}
+
+void updateAlarmSound() {
+  if (!alarmRinging) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - alarmStartedAt >= alarmRingDuration) {
+    stopAlarm();
+    return;
+  }
+
+  unsigned long interval = alarmBeepOn ? alarmBeepLength : alarmPauseLength;
+  if (now - lastAlarmBeepChange >= interval) {
+    alarmBeepOn = !alarmBeepOn;
+    digitalWrite(buzzerPin, alarmBeepOn ? HIGH : LOW);
+    lastAlarmBeepChange = now;
+  }
+}
+
+void updateAlarmServo() {
+  if (!alarmRinging || millis() - lastAlarmServoMove < alarmServoMoveDelay) {
+    return;
+  }
+
+  alarmServoAtMax = !alarmServoAtMax;
+  writeServoAngle(alarmServoAtMax ? 180 : 0);
+  lastAlarmServoMove = millis();
+}
+
+void checkAlarm() {
+  if (!alarmEnabled || alarmRinging || !timeSynced) {
+    return;
+  }
+
+  struct tm timeInfo;
+  if (!getLocalTime(&timeInfo, 50)) {
+    timeSynced = false;
+    return;
+  }
+
+  if (
+    timeInfo.tm_hour == alarmHour &&
+    timeInfo.tm_min == alarmMinute &&
+    timeInfo.tm_yday != lastAlarmTriggerDay
+  ) {
+    startAlarm(timeInfo);
+  }
+}
+
 void readJoystickSwitch() {
   switchState = digitalRead(joystickSwitchPin);
 
@@ -427,12 +575,14 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
+  pinMode(snoozeButtonPin, INPUT_PULLUP);
   pinMode(joystickSwitchPin, INPUT_PULLUP);
   pinMode(joystickXPin, INPUT);
   pinMode(joystickYPin, INPUT);
   analogReadResolution(12);
   joystickXCenter = calibrateJoystickCenter(joystickXPin);
   joystickYCenter = calibrateJoystickCenter(joystickYPin);
+  moveStartupServo();
   playStartupAlarm();
 
   lcd.init();
@@ -456,11 +606,20 @@ void setup() {
 }
 
 void loop() {
+  readSnoozeButton();
   readJoystick();
   retryTimeSyncIfNeeded();
+  checkAlarm();
+  updateAlarmSound();
+  updateAlarmServo();
 
   unsigned long now = millis();
-  if (currentScreen == SCREEN_ALARM_MENU) {
+  if (alarmRinging) {
+    if (displayDirty) {
+      displayAlarmRinging();
+      displayDirty = false;
+    }
+  } else if (currentScreen == SCREEN_ALARM_MENU) {
     if (displayDirty) {
       displayAlarmMenu();
       displayDirty = false;

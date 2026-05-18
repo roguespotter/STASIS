@@ -7,7 +7,8 @@ the alarm function is also connected to a buzzer to produce a blaring noise.
 This is all powered by a battery pack for the car and a USB power bank for the alarm itself. We had trouble with surging, so we had
 to split power supply.
 
-BOM: ILGOO RC CAR KIT
+BOM: 
+- ELEGOO SMART RC CAR KIT
 - ESP 32 DEV MOD
 - LIGHT SWITCH
 - 16 x 2 LCD SCREEN

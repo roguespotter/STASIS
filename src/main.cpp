@@ -38,6 +38,13 @@ const unsigned long alarmPauseLength = 120;
 const int motionTriggerPin = 19;
 const unsigned long motionTriggerPulseLength = 500;
 
+// ===== Relay =====
+const int relayPin = 17;
+const int relayOnSignal = LOW;
+const int relayOffSignal = HIGH;
+const unsigned long relayStartDelay = 5000;
+const unsigned long relayOnDuration = 12000;
+
 // ===== Servo =====
 const int servoPin = 16;
 const int servoChannel = 1;
@@ -50,7 +57,6 @@ const int servoStartAngle = 90;
 const int servoStartupWiggle = 6;
 const int servoAlarmSwing = 90;
 const unsigned long alarmServoMoveDelay = 200;
-const int alarmServoMoveCountBeforeMotion = 8;
 
 bool alarmEnabled = false;
 int alarmHour = 7;
@@ -91,12 +97,15 @@ unsigned long lastSnoozeButtonChange = 0;
 unsigned long lastSwitchChange = 0;
 unsigned long switchPressedAt = 0;
 unsigned long lastJoystickAction = 0;
+unsigned long alarmStartedAt = 0;
 unsigned long lastAlarmBeepChange = 0;
 unsigned long lastAlarmServoMove = 0;
+unsigned long relayStartedAt = 0;
 int lastAlarmTriggerDay = -1;
-int alarmServoMoveCount = 0;
 bool alarmBeepOn = false;
 bool alarmServoAwayFromStart = false;
+bool relayOn = false;
+bool relayComplete = false;
 bool motionStarted = false;
 int snoozeButtonState = HIGH;
 int lastSnoozeButtonState = HIGH;
@@ -108,6 +117,27 @@ bool displayDirty = true;
 
 void beginAlarmSequence();
 
+const char* wifiStatusText(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:
+      return "IDLE";
+    case WL_NO_SSID_AVAIL:
+      return "NO_SSID";
+    case WL_SCAN_COMPLETED:
+      return "SCAN_DONE";
+    case WL_CONNECTED:
+      return "CONNECTED";
+    case WL_CONNECT_FAILED:
+      return "FAIL";
+    case WL_CONNECTION_LOST:
+      return "LOST";
+    case WL_DISCONNECTED:
+      return "DISCONNECTED";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 void stopBuzzer() {
   digitalWrite(buzzerPin, LOW);
 }
@@ -116,6 +146,11 @@ void pulseMotionTrigger() {
   digitalWrite(motionTriggerPin, HIGH);
   delay(motionTriggerPulseLength);
   digitalWrite(motionTriggerPin, LOW);
+}
+
+void setRelay(bool enabled) {
+  relayOn = enabled;
+  digitalWrite(relayPin, enabled ? relayOnSignal : relayOffSignal);
 }
 
 void writeServoAngle(int angle) {
@@ -148,7 +183,8 @@ void stopAlarm() {
   alarmBeepOn = false;
   alarmServoAwayFromStart = false;
   motionStarted = false;
-  alarmServoMoveCount = 0;
+  relayComplete = false;
+  setRelay(false);
   stopBuzzer();
   writeServoAngle(servoStartAngle);
   displayDirty = true;
@@ -180,7 +216,9 @@ bool setupWiFi() {
     delay(500);
     Serial.print('.');
     if (millis() - start > 20000) {
-      Serial.println("\nWiFi connect timeout");
+      Serial.println();
+      Serial.print("WiFi connect timeout: ");
+      Serial.println(wifiStatusText(WiFi.status()));
       return false;
     }
   }
@@ -214,6 +252,8 @@ void retryTimeSyncIfNeeded() {
     wifiConnected = false;
     if (millis() - lastWiFiAttempt >= wifiRetryDelay) {
       lastWiFiAttempt = millis();
+      Serial.print("Retrying WiFi: ");
+      Serial.println(wifiStatusText(WiFi.status()));
       WiFi.disconnect();
       WiFi.begin(ssid, password);
       displayDirty = true;
@@ -233,14 +273,16 @@ void retryTimeSyncIfNeeded() {
 
 void displayDateTime() {
   struct tm timeInfo;
-  if (WiFi.status() != WL_CONNECTED) {
+  wl_status_t wifiStatus = WiFi.status();
+  if (wifiStatus != WL_CONNECTED) {
     timeSynced = false;
     wifiConnected = false;
     lcd.clear();
     lcd.setCursor(0, 0);
-    lcd.print("WiFi not ready");
+    lcd.print("WiFi ");
+    lcd.print(wifiStatusText(wifiStatus));
     lcd.setCursor(0, 1);
-    lcd.print("Check network");
+    lcd.print("Retrying...");
     return;
   }
 
@@ -464,12 +506,15 @@ void readSnoozeButton() {
 
 void beginAlarmSequence() {
   alarmRinging = true;
+  alarmStartedAt = millis();
   lastAlarmBeepChange = millis();
   lastAlarmServoMove = millis();
-  alarmServoMoveCount = 1;
+  relayStartedAt = 0;
   alarmBeepOn = true;
   alarmServoAwayFromStart = true;
+  relayComplete = false;
   motionStarted = false;
+  setRelay(false);
   digitalWrite(buzzerPin, HIGH);
   writeServoAngle(servoStartAngle + servoAlarmSwing);
   currentScreen = SCREEN_CLOCK;
@@ -496,24 +541,34 @@ void updateAlarmSound() {
 }
 
 void updateAlarmServo() {
-  if (
-    !alarmRinging ||
-    motionStarted ||
-    alarmServoMoveCount >= alarmServoMoveCountBeforeMotion ||
-    millis() - lastAlarmServoMove < alarmServoMoveDelay
-  ) {
-    if (alarmRinging && !motionStarted && alarmServoMoveCount >= alarmServoMoveCountBeforeMotion) {
-      writeServoAngle(servoStartAngle);
-      pulseMotionTrigger();
-      motionStarted = true;
-    }
+  if (!alarmRinging || relayOn || relayComplete || millis() - lastAlarmServoMove < alarmServoMoveDelay) {
     return;
   }
 
   alarmServoAwayFromStart = !alarmServoAwayFromStart;
   writeServoAngle(alarmServoAwayFromStart ? servoStartAngle + servoAlarmSwing : servoStartAngle);
-  alarmServoMoveCount++;
   lastAlarmServoMove = millis();
+}
+
+void updateAlarmRelayAndMotion() {
+  if (!alarmRinging || motionStarted) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (!relayOn && !relayComplete && now - alarmStartedAt >= relayStartDelay) {
+    writeServoAngle(servoStartAngle);
+    relayStartedAt = now;
+    setRelay(true);
+    return;
+  }
+
+  if (relayOn && now - relayStartedAt >= relayOnDuration) {
+    setRelay(false);
+    relayComplete = true;
+    pulseMotionTrigger();
+    motionStarted = true;
+  }
 }
 
 void checkAlarm() {
@@ -616,6 +671,8 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, relayOffSignal);
   pinMode(motionTriggerPin, OUTPUT);
   digitalWrite(motionTriggerPin, LOW);
   pinMode(snoozeButtonPin, INPUT_PULLUP);
@@ -655,6 +712,7 @@ void loop() {
   checkAlarm();
   updateAlarmSound();
   updateAlarmServo();
+  updateAlarmRelayAndMotion();
 
   unsigned long now = millis();
   if (alarmRinging) {

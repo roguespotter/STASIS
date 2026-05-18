@@ -31,10 +31,12 @@ int joystickYCenter = 2048;
 
 // ===== Buzzer =====
 const int buzzerPin = 23;
-const unsigned long startupAlarmDuration = 3000;
-const unsigned long alarmRingDuration = 30000;
 const unsigned long alarmBeepLength = 180;
 const unsigned long alarmPauseLength = 120;
+
+// ===== Elegoo Motion Trigger =====
+const int motionTriggerPin = 19;
+const unsigned long motionTriggerPulseLength = 500;
 
 // ===== Servo =====
 const int servoPin = 16;
@@ -44,7 +46,11 @@ const int servoFrequency = 50;
 const int servoMinPulse = 500;
 const int servoMaxPulse = 2500;
 const int servoPeriod = 20000;
-const unsigned long alarmServoMoveDelay = 250;
+const int servoStartAngle = 90;
+const int servoStartupWiggle = 6;
+const int servoAlarmSwing = 90;
+const unsigned long alarmServoMoveDelay = 200;
+const int alarmServoMoveCountBeforeMotion = 8;
 
 bool alarmEnabled = false;
 int alarmHour = 7;
@@ -58,7 +64,8 @@ enum Screen {
 
 enum MenuOption {
   MENU_TOGGLE_ALARM,
-  MENU_SET_ALARM_TIME
+  MENU_SET_ALARM_TIME,
+  MENU_DEV_TRIGGER_MOTION
 };
 
 enum SetAlarmField {
@@ -84,12 +91,13 @@ unsigned long lastSnoozeButtonChange = 0;
 unsigned long lastSwitchChange = 0;
 unsigned long switchPressedAt = 0;
 unsigned long lastJoystickAction = 0;
-unsigned long alarmStartedAt = 0;
 unsigned long lastAlarmBeepChange = 0;
 unsigned long lastAlarmServoMove = 0;
 int lastAlarmTriggerDay = -1;
+int alarmServoMoveCount = 0;
 bool alarmBeepOn = false;
-bool alarmServoAtMax = false;
+bool alarmServoAwayFromStart = false;
+bool motionStarted = false;
 int snoozeButtonState = HIGH;
 int lastSnoozeButtonState = HIGH;
 int stableSnoozeButtonState = HIGH;
@@ -98,8 +106,16 @@ int lastSwitchState = HIGH;
 int stableSwitchState = HIGH;
 bool displayDirty = true;
 
+void beginAlarmSequence();
+
 void stopBuzzer() {
   digitalWrite(buzzerPin, LOW);
+}
+
+void pulseMotionTrigger() {
+  digitalWrite(motionTriggerPin, HIGH);
+  delay(motionTriggerPulseLength);
+  digitalWrite(motionTriggerPin, LOW);
 }
 
 void writeServoAngle(int angle) {
@@ -113,42 +129,42 @@ void moveStartupServo() {
   ledcSetup(servoChannel, servoFrequency, servoResolution);
   ledcAttachPin(servoPin, servoChannel);
 
-  writeServoAngle(0);
-  delay(400);
-  writeServoAngle(90);
-  delay(400);
-  writeServoAngle(180);
-  delay(400);
-  writeServoAngle(90);
-  delay(400);
+  writeServoAngle(servoStartAngle);
+  delay(300);
+  writeServoAngle(servoStartAngle + servoStartupWiggle);
+  delay(250);
+  writeServoAngle(servoStartAngle - servoStartupWiggle);
+  delay(250);
+  writeServoAngle(servoStartAngle);
+  delay(300);
 }
 
 void stopAlarm() {
+  if (motionStarted) {
+    pulseMotionTrigger();
+  }
+
   alarmRinging = false;
   alarmBeepOn = false;
-  alarmServoAtMax = false;
+  alarmServoAwayFromStart = false;
+  motionStarted = false;
+  alarmServoMoveCount = 0;
   stopBuzzer();
-  writeServoAngle(90);
+  writeServoAngle(servoStartAngle);
   displayDirty = true;
 }
 
 void playStartupAlarm() {
-  const unsigned long beepLength = 120;
-  const unsigned long pauseLength = 90;
-  const unsigned long groupPauseLength = 320;
+  const unsigned long beepLength = 100;
+  const unsigned long pauseLength = 120;
 
   pinMode(buzzerPin, OUTPUT);
 
-  unsigned long startedAt = millis();
-  while (millis() - startedAt < startupAlarmDuration) {
-    for (int beep = 0; beep < 4 && millis() - startedAt < startupAlarmDuration; beep++) {
-      digitalWrite(buzzerPin, HIGH);
-      delay(beepLength);
-      digitalWrite(buzzerPin, LOW);
-      delay(pauseLength);
-    }
-
-    delay(groupPauseLength);
+  for (int beep = 0; beep < 2; beep++) {
+    digitalWrite(buzzerPin, HIGH);
+    delay(beepLength);
+    digitalWrite(buzzerPin, LOW);
+    delay(pauseLength);
   }
 
   stopBuzzer();
@@ -258,7 +274,7 @@ void displayAlarmRinging() {
   lcd.setCursor(0, 0);
   lcd.print("ALARM!");
   lcd.setCursor(0, 1);
-  lcd.print("Click to stop");
+  lcd.print("D18 to stop");
 }
 
 int to12Hour(int hour24) {
@@ -288,7 +304,13 @@ void saveDraftAlarmTime() {
 
 void displayAlarmMenu() {
   char line1[17];
-  const char* selectedText = menuSelection == MENU_TOGGLE_ALARM ? ">Toggle Alarm" : ">Set Time";
+  const char* selectedText = ">Toggle Alarm";
+
+  if (menuSelection == MENU_SET_ALARM_TIME) {
+    selectedText = ">Set Time";
+  } else if (menuSelection == MENU_DEV_TRIGGER_MOTION) {
+    selectedText = ">Dev Move Test";
+  }
 
   snprintf(
     line1,
@@ -351,7 +373,13 @@ void toggleAlarm() {
 }
 
 void selectNextMenuOption() {
-  menuSelection = menuSelection == MENU_TOGGLE_ALARM ? MENU_SET_ALARM_TIME : MENU_TOGGLE_ALARM;
+  if (menuSelection == MENU_TOGGLE_ALARM) {
+    menuSelection = MENU_SET_ALARM_TIME;
+  } else if (menuSelection == MENU_SET_ALARM_TIME) {
+    menuSelection = MENU_DEV_TRIGGER_MOTION;
+  } else {
+    menuSelection = MENU_TOGGLE_ALARM;
+  }
   displayDirty = true;
 }
 
@@ -401,10 +429,12 @@ void handleShortPressEvent() {
   if (currentScreen == SCREEN_ALARM_MENU) {
     if (menuSelection == MENU_TOGGLE_ALARM) {
       toggleAlarm();
-    } else {
+    } else if (menuSelection == MENU_SET_ALARM_TIME) {
       loadDraftAlarmTime();
       currentScreen = SCREEN_SET_ALARM;
       displayDirty = true;
+    } else if (menuSelection == MENU_DEV_TRIGGER_MOTION) {
+      beginAlarmSequence();
     }
   } else if (currentScreen == SCREEN_SET_ALARM && setAlarmSelection == SET_FIELD_CONFIRM) {
     saveDraftAlarmTime();
@@ -432,18 +462,23 @@ void readSnoozeButton() {
   lastSnoozeButtonState = snoozeButtonState;
 }
 
-void startAlarm(const tm& timeInfo) {
+void beginAlarmSequence() {
   alarmRinging = true;
-  alarmStartedAt = millis();
   lastAlarmBeepChange = millis();
   lastAlarmServoMove = millis();
-  lastAlarmTriggerDay = timeInfo.tm_yday;
+  alarmServoMoveCount = 1;
   alarmBeepOn = true;
-  alarmServoAtMax = true;
+  alarmServoAwayFromStart = true;
+  motionStarted = false;
   digitalWrite(buzzerPin, HIGH);
-  writeServoAngle(180);
+  writeServoAngle(servoStartAngle + servoAlarmSwing);
   currentScreen = SCREEN_CLOCK;
   displayDirty = true;
+}
+
+void startAlarm(const tm& timeInfo) {
+  lastAlarmTriggerDay = timeInfo.tm_yday;
+  beginAlarmSequence();
 }
 
 void updateAlarmSound() {
@@ -451,13 +486,8 @@ void updateAlarmSound() {
     return;
   }
 
-  unsigned long now = millis();
-  if (now - alarmStartedAt >= alarmRingDuration) {
-    stopAlarm();
-    return;
-  }
-
   unsigned long interval = alarmBeepOn ? alarmBeepLength : alarmPauseLength;
+  unsigned long now = millis();
   if (now - lastAlarmBeepChange >= interval) {
     alarmBeepOn = !alarmBeepOn;
     digitalWrite(buzzerPin, alarmBeepOn ? HIGH : LOW);
@@ -466,12 +496,23 @@ void updateAlarmSound() {
 }
 
 void updateAlarmServo() {
-  if (!alarmRinging || millis() - lastAlarmServoMove < alarmServoMoveDelay) {
+  if (
+    !alarmRinging ||
+    motionStarted ||
+    alarmServoMoveCount >= alarmServoMoveCountBeforeMotion ||
+    millis() - lastAlarmServoMove < alarmServoMoveDelay
+  ) {
+    if (alarmRinging && !motionStarted && alarmServoMoveCount >= alarmServoMoveCountBeforeMotion) {
+      writeServoAngle(servoStartAngle);
+      pulseMotionTrigger();
+      motionStarted = true;
+    }
     return;
   }
 
-  alarmServoAtMax = !alarmServoAtMax;
-  writeServoAngle(alarmServoAtMax ? 180 : 0);
+  alarmServoAwayFromStart = !alarmServoAwayFromStart;
+  writeServoAngle(alarmServoAwayFromStart ? servoStartAngle + servoAlarmSwing : servoStartAngle);
+  alarmServoMoveCount++;
   lastAlarmServoMove = millis();
 }
 
@@ -537,20 +578,20 @@ void readJoystickAxes() {
     return;
   }
 
-  int yDirection = readJoystickDirection(joystickYPin, joystickYCenter);
+  int yDirection = -readJoystickDirection(joystickYPin, joystickYCenter);
   int xDirection = readJoystickDirection(joystickXPin, joystickXCenter);
 
   if (currentScreen == SCREEN_ALARM_MENU) {
-    if (yDirection != 0) {
+    if (xDirection != 0) {
       selectNextMenuOption();
       lastJoystickAction = millis();
     }
   } else if (currentScreen == SCREEN_SET_ALARM) {
-    if (xDirection != 0) {
-      moveSetAlarmSelection(xDirection);
+    if (yDirection != 0) {
+      moveSetAlarmSelection(yDirection);
       lastJoystickAction = millis();
-    } else if (yDirection != 0) {
-      adjustDraftAlarmValue(-yDirection);
+    } else if (xDirection != 0) {
+      adjustDraftAlarmValue(-xDirection);
       lastJoystickAction = millis();
     }
   }
@@ -575,6 +616,8 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
+  pinMode(motionTriggerPin, OUTPUT);
+  digitalWrite(motionTriggerPin, LOW);
   pinMode(snoozeButtonPin, INPUT_PULLUP);
   pinMode(joystickSwitchPin, INPUT_PULLUP);
   pinMode(joystickXPin, INPUT);
